@@ -160,6 +160,57 @@ fn main() {
 
 
 
+## 一些特殊情况
+
+```c
+int Leaf(int g, int h, int i, int j) {
+    int f;
+    f = (g + h) - (i + j);
+    return f;
+}
+int main(){
+    Leaf(1,1,1,1);
+    return 0;
+}
+```
+
+对于这样一段C语言代码，如果使用默认的gcc对其编译，得到的汇编代码如下
+
+<img src="assets/image-20230905203257591.png" alt="image-20230905203257591" style="zoom:67%;" />
+
+<img src="assets/image-20230905203339287.png" alt="image-20230905203339287" style="zoom:67%;" />
+
+在`Leaf`函数中，可以看到并没有保存`ra`寄存器的指令，但在main函数中则保存了。对于一个函数来说，其一般在内部调用其他函数时才会保存`ra`寄存器，因此当我们使用frame point方法进行回溯的时候，不能直接就确定(fp-8)位置处保存的就是ra。
+
+
+
+### 2 不保存ra导致无法回溯
+
+对于这样一段rust代码:
+
+```rust
+pub fn current_cpu() -> &'static mut CPU {
+    let hart_id = arch::hart_id();
+    unsafe {
+        panic!("Test panic");
+        ....
+    }
+    ....
+}
+```
+
+编译在生成这样的代码时，不会生成保存ra的指令，因为这是一个直接panic的函数，意味着不会再次回到这个函数，这导致利用编译器代码生成特点进行回溯的方法无法获取到ra的值，只能在使用DWARF方法时才能解决这个歌问题。内核中这样的代码比较少见。
+
+### 3 多次使用addi sp, sp指令
+
+这种情况下，无论是基于fp，还是使用编译器指令生成回溯都比较困难。
+
+![image-20230906194530404](assets/image-20230906194530404.png)
+
+
+
+
+
 ## 参考资料
 https://blog.csdn.net/pwl999/article/details/107569603
 https://doc.rust-lang.org/rustc/codegen-options/index.html

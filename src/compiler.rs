@@ -1,14 +1,7 @@
-use alloc::format;
-use alloc::string::String;
-use alloc::vec::Vec;
 use bit_field::BitField;
 use core::arch::asm;
-use log::trace;
-
-pub trait Symbol {
-    fn addr(&self) -> usize;
-    fn name(&self) -> &str;
-}
+use log::{info, trace};
+use crate::{TraceInfo, Tracer, TracerProvider};
 
 // 在函数第一条指令，开辟栈空间
 // 指令 addi sp,sp,imm 4字节
@@ -18,16 +11,17 @@ pub trait Symbol {
 // 000 [imm5] rd [imm4-0] 01
 // c.addi16sp imm
 // 011 [imm9] 00010 [imm4|6|8|7|5] 01
-
+#[derive(Debug,Copy, Clone)]
 enum InstructionSp {
     Addi(u32),
     CAddi(u32),
     CAddi16Sp(u32),
-    Unknown,
 }
-
 impl InstructionSp {
     fn new(ins: u32) -> Self {
+        Self::try_new(ins,|imm|{imm<0}).unwrap()
+    }
+    fn try_new(ins:u32,f:fn(i32)->bool)->Option<Self>{
         let opcode = ins.get_bits(0..7);
         match opcode {
             0b0010011 => {
@@ -37,8 +31,11 @@ impl InstructionSp {
                     imm.set_bit(i, imm.get_bit(11));
                 }
                 let imm = imm as i32;
-                assert!(imm < 0);
-                InstructionSp::Addi((-imm) as u32)
+                if f(imm){
+                   Some(InstructionSp::Addi((-imm) as u32))
+                }else {
+                    None
+                }
             }
             _ => {
                 let short_ins = ins.get_bits(0..16);
@@ -49,7 +46,7 @@ impl InstructionSp {
                         // 保证是sp
                         let rd = short_ins.get_bits(7..12);
                         if rd != 2 {
-                            return InstructionSp::Unknown;
+                            return None;
                         }
                         let mut imm = 0;
                         imm.set_bits(0..5, short_ins.get_bits(2..7));
@@ -60,13 +57,16 @@ impl InstructionSp {
                         }
                         let imm = imm as i32;
                         trace!("[CADDI] {:#b}", imm);
-                        assert!(imm < 0);
-                        InstructionSp::CAddi((-imm) as u32)
+                        if f(imm) {
+                            Some(InstructionSp::CAddi((-imm) as u32))
+                        }else {
+                            None
+                        }
                     }
                     (0b011, 0b01) => {
                         let flag = short_ins.get_bits(7..=11);
                         if flag != 0b00010 {
-                            return InstructionSp::Unknown;
+                            return None;
                         }
                         let mut imm = 0u32;
                         imm.set_bit(9, short_ins.get_bit(12));
@@ -80,17 +80,20 @@ impl InstructionSp {
                         }
                         let imm = imm as i32;
                         trace!("sp_size: {}", -imm);
-                        assert!(imm < 0);
-                        InstructionSp::CAddi16Sp((-imm) as u32)
+                        if f(imm){
+                           Some(InstructionSp::CAddi16Sp((-imm) as u32))
+                        }else {
+                            None
+                        }
                     }
-                    _ => InstructionSp::Unknown,
+                    _ => None,
                 }
             }
         }
     }
 }
 
-fn sd_ra(ins: u32) -> Option<u32> {
+fn check_sd_ra(ins: u32) -> Option<u32> {
     // 检查指令是否是存储ra
     let opcode = ins.get_bits(0..7);
     return match opcode {
@@ -100,8 +103,8 @@ fn sd_ra(ins: u32) -> Option<u32> {
             if func != 0b011 {
                 return None;
             }
-            let rd = ins.get_bits(15..=19); //sp
-            let rt = ins.get_bits(20..=24); //ra
+            let rd = ins.get_bits(15..=19); // sp
+            let rt = ins.get_bits(20..=24); // ra
             if rd != 2 || rt != 1 {
                 return None;
             }
@@ -135,71 +138,193 @@ fn sd_ra(ins: u32) -> Option<u32> {
     };
 }
 
-pub unsafe fn my_trace<T: Symbol>(symbol: Vec<T>) -> Vec<String> {
-    let s = my_trace::<T> as usize;
-    // 函数的第一条指令
-    let mut ins = s as *const u32;
-    let mut sp = {
-        let t: usize;
-        asm!("mv {},sp",out(reg)t);
-        t
-    };
-    let mut ans_str = Vec::new();
-    loop {
-        let first_ins = ins.read_volatile();
+
+pub struct CompilerTracer<T>{
+    provider:T,
+}
+
+pub struct CompilerTracerIterator<'a,T>{
+    /// The first instruction address of the function
+    f_ins_addr:usize,
+    /// The sp value
+    sp:usize,
+    /// The ra value
+    ra:usize,
+    provider:&'a T,
+}
+impl<T> CompilerTracer<T> {
+    pub fn new(provider:T) -> Self {
+        Self{
+            provider,
+        }
+    }
+}
+
+
+
+impl <T: TracerProvider> Tracer for CompilerTracer<T>{
+    fn trace(&self) -> impl Iterator<Item=TraceInfo> + '_ {
+        CompilerTracerIterator{
+            f_ins_addr:0,
+            sp:0,
+            ra: 0,
+            provider:&self.provider,
+        }
+    }
+}
+
+impl<T:TracerProvider> Iterator for CompilerTracerIterator<'_,T>{
+    type Item = TraceInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.sp == 0{
+            // 第一次调用
+            let trace_addr = Self::next as usize;
+            self.sp = {
+                let t: usize;
+                unsafe {
+                    asm!("mv {},sp",out(reg)t);
+                }
+                t
+            };
+            self.f_ins_addr = trace_addr;
+            self.ra = trace_addr;
+        }
+        let first_ins = read_instruction(self.f_ins_addr);
+        info!("f_ins_addr: {:#x}, short_ins:{:#x}", self.f_ins_addr,read_instruction_short(self.f_ins_addr));
         trace!(
             "first_ins: {:#x} {:#b}",
             first_ins.get_bits(0..16),
             first_ins.get_bits(0..16)
         );
         let ans = InstructionSp::new(first_ins);
-        let (next_ins, size) = match ans {
+        let (next_ins_addr,next_ins, mut stack_size) = match ans {
             InstructionSp::Addi(size) => {
                 // 四字节指令
-                (ins.add(1).read_volatile(), size)
+                (self.f_ins_addr+4,read_instruction(self.f_ins_addr + 4), size)
             }
             InstructionSp::CAddi(size) | InstructionSp::CAddi16Sp(size) => {
                 // 双字节指令
-                let ins = (ins as *const u16).add(1) as *const u32;
-                (ins.read_volatile(), size)
-            }
-            InstructionSp::Unknown => {
-                // 未知指令
-                break;
+                (self.f_ins_addr+2,read_instruction(self.f_ins_addr+2), size)
             }
         };
+        info!("next_ins:{:#x}, stack_size: {}, ra:{:#x}", next_ins, stack_size,self.ra);
         // 第二条指令就是记录有ra的值
         // 需要确保第二条指令是否是存储ra
-        if sd_ra(next_ins).is_none() {
-            break;
+        if check_sd_ra(next_ins).is_none() {
+            return None;
         }
-        let stack_size = size;
-        let ra_addr = sp + stack_size as usize - 8;
-        let ra = (ra_addr as *const usize).read_volatile(); //8字节存储
-        trace!("ra: {:#x}", ra);
 
-        let mut flag = false;
-        for i in 0..symbol.len() {
-            if symbol[i].addr() == ra
-                || (i + 1 < symbol.len() && (symbol[i].addr()..symbol[i + 1].addr()).contains(&ra))
-            {
-                let str = format!(
-                    "{:#x} (+{}) {}",
-                    symbol[i].addr(),
-                    ra - symbol[i].addr(),
-                    symbol[i].name()
-                );
-                trace!("{}", str);
-                ins = symbol[i].addr() as *const u32;
-                flag = true;
-                ans_str.push(str.clone());
-                break;
+        // 在一些函数中，可能不止在第一条指令中调用了addi sp,sp,imm
+        // 因此我们需要扫描函数开始到ra之间的指令，检查是否还出现了addi sp,sp,imm
+
+        let mut start = next_ins_addr;
+        let end = self.ra;
+        while start < end{
+            let short_ins = read_instruction_short(start);
+            if is_caddi16sp(short_ins) || is_caddi(short_ins){
+                let ins = InstructionSp::try_new(short_ins as u32,|imm|{imm < 0});
+                if ins.is_none(){
+                    start += 2;
+                    continue
+                }
+                let ins = ins.unwrap();
+                info!("addr: {:#x}, scan short_ins: {:?}", start,ins);
+                match ins {
+                    InstructionSp::Addi(size) => {
+                        stack_size += size;
+                    }
+                    InstructionSp::CAddi(size) | InstructionSp::CAddi16Sp(size) => {
+                        stack_size += size;
+                    }
+                }
+                start += 2;
+            } else if maybe_is_addi(short_ins){
+                let ins = read_instruction(start);
+                let ins = InstructionSp::try_new(ins,|imm|{imm < 0});
+                if ins.is_none(){
+                    start += 4;
+                    continue
+                }
+                let ins = ins.unwrap();
+                info!("addr: {:#x}, scan ins: {:?}",start, ins);
+                match ins {
+                    InstructionSp::Addi(x) => {
+                        stack_size += x;
+                    }
+                    _ => {}
+                }
+                start += 4;
+            }else {
+                start += 2;
             }
         }
-        if !flag {
-            break;
+        let ra_addr = self.sp + stack_size as usize - 8;
+        let ra = read_value(ra_addr); // 8字节存储
+        info!("after scan, stack size :{} ra_addr:{:#x}, ra: {:#x}",stack_size ,ra_addr,ra);
+        let father_func_info = self.provider.address2symbol(ra);
+        if father_func_info.is_none() {
+            return None;
         }
-        sp += stack_size as usize;
+        let father_func_info = father_func_info.unwrap();
+        self.f_ins_addr = father_func_info.0;
+        self.sp += stack_size as usize;  // back to father stack
+        self.ra = ra;
+        Some(TraceInfo{
+            func_name:father_func_info.1,
+            func_addr:father_func_info.0,
+            bias:ra-father_func_info.0,
+        })
     }
-    ans_str
+}
+
+
+fn is_caddi(ins:u16)->bool{
+    let high = ins.get_bits(13..16);
+    let low = ins.get_bits(0..2);
+    match (high, low) {
+        (0b000, 0b01) => {
+            // 保证是sp
+            let rd = ins.get_bits(7..12);
+            if rd != 2 {
+                return false;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_caddi16sp(ins:u16)->bool{
+    let high = ins.get_bits(13..16);
+    let low = ins.get_bits(0..2);
+    match (high, low) {
+        (0b011, 0b01) => {
+            let flag = ins.get_bits(7..=11);
+            if flag != 0b00010 {
+                return false;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// imm\[11:0] rs 000 rd 0010011
+///
+/// 0001\[0 000 00010 0010011]
+/// 001--0x0113
+fn maybe_is_addi(ins:u16)->bool{
+    ins == 0x113
+}
+
+fn read_instruction(addr:usize)->u32{
+    unsafe {((addr) as *const u32).read_volatile()}
+}
+fn read_instruction_short(addr:usize)->u16{
+    unsafe {((addr) as *const u16).read_volatile()}
+}
+
+fn read_value(addr:usize)->usize{
+    unsafe {((addr) as *const usize).read_volatile()}
 }
