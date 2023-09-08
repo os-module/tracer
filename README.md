@@ -209,10 +209,27 @@ pub fn current_cpu() -> &'static mut CPU {
 
 
 
+## How To Enable eh-frame-hdr
+
+```
+rustflags = [
+    "-C", "force-unwind-tables=yes",
+    "-C", "link-args=--eh-frame-hdr"
+]
+```
+
 
 
 ## 参考资料
 https://blog.csdn.net/pwl999/article/details/107569603
 https://doc.rust-lang.org/rustc/codegen-options/index.html
 
+[Unwinding the stack the hard way • lesenechal.fr](https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way)
+
 [DWARF Debugging Information Format Version 5 (dwarfstd.org)](https://dwarfstd.org/doc/DWARF5.pdf)
+
+[linux 栈回溯(x86_64 ) - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/302726082)
+
+[RISC-V 编程之 Frame Pointer和 backtrace_riscv backtrace_半斗米的博客-CSDN博客](https://blog.csdn.net/zoomdy/article/details/123140219)
+
+[Airs – Ian Lance Taylor » .eh_frame_hdr](https://www.airs.com/blog/archives/462)

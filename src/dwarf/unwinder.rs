@@ -1,43 +1,83 @@
 use super::arch::{MachineState, RegisterSet};
-use super::{
-    __kernel_eh_frame, __kernel_eh_frame_end, __kernel_eh_frame_hdr, __kernel_eh_frame_hdr_end,
-};
+use crate::{DwarfProvider, TraceInfo, Tracer, TracerProvider};
 use alloc::boxed::Box;
+use core::arch::asm;
 use core::fmt::{Debug, Formatter};
 use core::mem::size_of;
-use core::ptr::addr_of;
 use core::slice;
 use gimli::{
     BaseAddresses, CfaRule, EhFrame, EhFrameHdr, EhHdrTable, EndianSlice, LittleEndian,
     ParsedEhFrameHdr, Register, RegisterRule, UnwindContext, UnwindSection,
 };
 use log::trace;
+use crate::utils::read_value;
 
-#[derive(Debug)]
-pub struct Backtrace {
-    unwinder: Unwinder,
+pub struct DwarfTracer<T, M> {
+    dwarf_provider: T,
+    machine_state: MachineState,
+    tracer_provider: M,
 }
 
-type VAddr = usize;
-
-#[derive(Debug)]
-pub struct CallFrame {
-    pub pc: VAddr,
-    pub symbol: Option<&'static str>,
-    pub sym_off: Option<usize>,
-    pub file_line: Option<(&'static str, u32)>,
-}
-
-impl Backtrace {
-    pub fn from_machine_state(machine: &MachineState) -> Self {
+impl<T: DwarfProvider, M: TracerProvider> DwarfTracer<T, M> {
+    pub fn new(dwarf_provider: T, tracer_provider: M) -> Self {
+        let machine = MachineState {
+            pc: {
+                let pc: usize;
+                unsafe {
+                    asm!("auipc {},0", out(reg) pc);
+                }
+                pc as u64
+            },
+            sp: {
+                let sp: usize;
+                unsafe {
+                    asm!("mv {},sp", out(reg) sp);
+                }
+                sp as u64
+            },
+            fp: {
+                let fp: usize;
+                unsafe {
+                    asm!("mv {},s0", out(reg) fp);
+                }
+                fp as u64
+            },
+            ra: {
+                let ra: usize;
+                unsafe {
+                    asm!("mv {},ra", out(reg) ra);
+                }
+                ra as u64
+            },
+        };
         Self {
-            unwinder: Unwinder::new(EhInfo::new(), RegisterSet::from_machine_state(machine)),
+            machine_state: machine,
+            dwarf_provider,
+            tracer_provider,
         }
     }
 }
 
-impl Iterator for Backtrace {
-    type Item = CallFrame;
+struct DwarfTracerIterator<'a, M> {
+    unwinder: Unwinder,
+    provider: &'a M,
+}
+
+impl<T: DwarfProvider, M: TracerProvider> Tracer for DwarfTracer<T, M> {
+    fn trace(&self) -> impl Iterator<Item = TraceInfo> + '_ {
+        let unwinder = Unwinder::new(
+            EhInfo::new(&self.dwarf_provider),
+            RegisterSet::from_machine_state(&self.machine_state),
+        );
+        DwarfTracerIterator {
+            unwinder,
+            provider: &self.tracer_provider,
+        }
+    }
+}
+
+impl<M: TracerProvider> Iterator for DwarfTracerIterator<'_, M> {
+    type Item = TraceInfo;
 
     fn next(&mut self) -> Option<Self::Item> {
         let pc = self.unwinder.next().ok()??;
@@ -45,11 +85,11 @@ impl Iterator for Backtrace {
         if pc == 0 {
             return None;
         }
-        Some(CallFrame {
-            pc: pc as usize,
-            symbol: None,
-            sym_off: None,
-            file_line: None,
+        let info = self.provider.address2symbol(pc as usize)?;
+        Some(TraceInfo {
+            func_name: info.1,
+            func_addr: info.0,
+            bias: pc as usize - info.0,
         })
     }
 }
@@ -68,41 +108,37 @@ pub enum UnwinderError {
 #[derive(Debug)]
 struct EhInfo {
     base_addrs: BaseAddresses,
-    #[allow(dead_code)]
+    #[allow(unused)]
     hdr: &'static ParsedEhFrameHdr<EndianSlice<'static, LittleEndian>>,
     hdr_table: EhHdrTable<'static, EndianSlice<'static, LittleEndian>>,
     eh_frame: EhFrame<EndianSlice<'static, LittleEndian>>,
 }
 
 impl EhInfo {
-    fn new() -> Self {
-        let hdr = unsafe { addr_of!(__kernel_eh_frame_hdr) };
-        let hdr_len = (unsafe { addr_of!(__kernel_eh_frame_hdr_end) } as usize) - (hdr as usize);
-        let eh_frame = unsafe { addr_of!(__kernel_eh_frame) };
-        let eh_frame_len =
-            (unsafe { addr_of!(__kernel_eh_frame_end) } as usize) - (eh_frame as usize);
-        trace!("hdr: {:p}, len: {}", hdr, hdr_len);
-        trace!("eh_frame: {:p}, len: {}", eh_frame, eh_frame_len);
+    fn new<T: DwarfProvider>(provider: &T) -> Self {
+        let hdr = provider.kernel_eh_frame_hdr();
+        let hdr_len = provider.kernel_eh_frame_hdr_end() - hdr;
+        let eh_frame = provider.kernel_eh_frame();
+        let eh_frame_len = provider.kernel_eh_frame_end() - eh_frame;
+        trace!("hdr: {:#x?}, len: {}", hdr, hdr_len);
+        trace!("eh_frame: {:#x?}, len: {}", eh_frame, eh_frame_len);
         let mut base_addrs = BaseAddresses::default();
         base_addrs = base_addrs.set_eh_frame_hdr(hdr as u64);
 
         let hdr = Box::leak(Box::new(
             EhFrameHdr::new(
                 // TODO: remove Box
-                unsafe { slice::from_raw_parts(hdr, hdr_len) },
+                unsafe { slice::from_raw_parts(hdr as *const u8, hdr_len) },
                 LittleEndian,
             )
             .parse(&base_addrs, size_of::<usize>() as u8)
             .unwrap(),
         ));
-
         base_addrs = base_addrs.set_eh_frame(eh_frame as u64);
-
         let eh_frame = EhFrame::new(
-            unsafe { slice::from_raw_parts(eh_frame, eh_frame_len) },
+            unsafe { slice::from_raw_parts(eh_frame as *const u8, eh_frame_len) },
             LittleEndian,
         );
-
         Self {
             base_addrs,
             hdr,
@@ -158,6 +194,7 @@ impl Unwinder {
             )
             .map_err(|_| UnwinderError::NoUnwindInfo)?;
 
+        trace!("row: {:#x?}", row);
         match row.cfa() {
             CfaRule::RegisterAndOffset { register, offset } => {
                 let reg_val = self
@@ -168,15 +205,18 @@ impl Unwinder {
             }
             _ => return Err(UnwinderError::UnsupportedCfaRule),
         }
+        trace!("cfa:{:#x}, regs:{:#x?}", self.cfa, self.regs);
 
         // find the symbol associated with the current pc
         for reg in RegisterSet::iter() {
-            match row.register(reg) {
+            let rule = row.register(reg);
+            trace!("reg: {:?}, rule: {:?}", reg, rule);
+            match rule {
                 RegisterRule::Undefined => self.regs.undef(reg),
                 RegisterRule::SameValue => (),
                 RegisterRule::Offset(offset) => {
-                    let ptr = (self.cfa as i64 + offset) as u64 as *const usize;
-                    self.regs.set(reg, unsafe { ptr.read() } as u64)?;
+                    let ptr = (self.cfa as i64 + offset) as usize;
+                    self.regs.set(reg, read_value(ptr) as u64)?;
                 }
                 RegisterRule::Register(_r) => {
                     todo!()
@@ -194,6 +234,7 @@ impl Unwinder {
                 _ => return Err(UnwinderError::UnimplementedRegisterRule),
             }
         }
+        trace!("after cal, regs:{:#x?}", self.regs);
         let ret = self.regs.get_ret().ok_or(UnwinderError::NoReturnAddr)?;
         self.regs.set_pc(ret);
         self.regs.set_stack_ptr(self.cfa);

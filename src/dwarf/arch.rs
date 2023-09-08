@@ -18,15 +18,7 @@ pub struct MachineState {
     pub ra: u64,
 }
 
-impl MachineState {
-    #[allow(dead_code)]
-    pub fn new(pc: u64, sp: u64, fp: u64, ra: u64) -> Self {
-        Self { pc, sp, fp, ra }
-    }
-}
-
 impl RegisterSet {
-    #[allow(dead_code)]
     pub fn from_machine_state(machine: &MachineState) -> Self {
         Self {
             pc: Some(machine.pc),
