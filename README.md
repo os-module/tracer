@@ -176,9 +176,9 @@ int main(){
 
 对于这样一段C语言代码，如果使用默认的gcc对其编译，得到的汇编代码如下
 
-<img src="assets/image-20230905203257591.png" alt="image-20230905203257591" style="zoom:67%;" />
+<img src="assert/image-20230905203257591.png" alt="image-20230905203257591" style="zoom:67%;" />
 
-<img src="assets/image-20230905203339287.png" alt="image-20230905203339287" style="zoom:67%;" />
+<img src="assert/image-20230905203339287.png" alt="image-20230905203339287" style="zoom:67%;" />
 
 在`Leaf`函数中，可以看到并没有保存`ra`寄存器的指令，但在main函数中则保存了。对于一个函数来说，其一般在内部调用其他函数时才会保存`ra`寄存器，因此当我们使用frame point方法进行回溯的时候，不能直接就确定(fp-8)位置处保存的就是ra。
 
@@ -205,7 +205,7 @@ pub fn current_cpu() -> &'static mut CPU {
 
 这种情况下，无论是基于fp，还是使用编译器指令生成回溯都比较困难。
 
-![image-20230906194530404](assets/image-20230906194530404.png)
+![image-20230906194530404](assert/image-20230906194530404.png)
 
 
 
